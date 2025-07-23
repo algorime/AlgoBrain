@@ -193,6 +193,7 @@ QDRANT_COLLECTIONS = {
         "vectors_config": VectorParams(size=768, distance=Distance.COSINE),
         "payload_schema": {
             "content": "text",
+            "neo4j_node_id": "keyword",  # Link to source of truth in Neo4j
             "payload_type": "keyword",
             "attack_types": "keyword[]",
             "target_platforms": "keyword[]", 
@@ -212,6 +213,7 @@ QDRANT_COLLECTIONS = {
         "vectors_config": VectorParams(size=768, distance=Distance.COSINE),
         "payload_schema": {
             "content": "text",
+            "neo4j_node_id": "keyword",  # Link to source of truth in Neo4j
             "mitre_id": "keyword",
             "name": "text",
             "tactic": "keyword",
@@ -229,6 +231,7 @@ QDRANT_COLLECTIONS = {
         "vectors_config": VectorParams(size=768, distance=Distance.COSINE),
         "payload_schema": {
             "content": "text",
+            "neo4j_node_id": "keyword",  # Link to source of truth in Neo4j
             "tool_name": "keyword",
             "tool_category": "keyword",
             "operating_systems": "keyword[]",
@@ -245,6 +248,7 @@ QDRANT_COLLECTIONS = {
         "vectors_config": VectorParams(size=768, distance=Distance.COSINE),
         "payload_schema": {
             "content": "text",
+            "neo4j_node_id": "keyword",  # Link to source of truth in Neo4j
             "threat_actor": "keyword",
             "campaign": "keyword",
             "first_seen": "datetime",
@@ -285,7 +289,7 @@ CREATE FULLTEXT INDEX tool_search FOR (to:Tool) ON EACH [to.name, to.description
 (:Technique {
     mitre_id: "T1059.001",
     name: "PowerShell",
-    description: "Adversaries may abuse PowerShell commands...",
+    content_uri: "minio://techniques/T1059.001/description.txt",  # Raw content in object store
     platforms: ["Windows"],
     data_sources: ["Command", "Process"],
     permissions_required: ["User", "Administrator"],
@@ -299,7 +303,7 @@ CREATE FULLTEXT INDEX tool_search FOR (to:Tool) ON EACH [to.name, to.description
 (:Tactic {
     mitre_id: "TA0002",
     name: "Execution", 
-    description: "The adversary is trying to run malicious code.",
+    content_uri: "minio://tactics/TA0002/description.txt",  # Raw content in object store
     created: datetime("2018-10-17T00:14:20.652Z"),
     modified: datetime("2019-07-19T17:43:41.967Z")
 })
@@ -308,7 +312,7 @@ CREATE FULLTEXT INDEX tool_search FOR (to:Tool) ON EACH [to.name, to.description
 (:Tool {
     mitre_id: "S0154",
     name: "Cobalt Strike",
-    description: "Cobalt Strike is a commercial penetration testing tool...",
+    content_uri: "minio://tools/S0154/description.txt",  # Raw content in object store
     type: "malware",
     platforms: ["Windows"],
     aliases: ["CS"],
@@ -320,7 +324,7 @@ CREATE FULLTEXT INDEX tool_search FOR (to:Tool) ON EACH [to.name, to.description
 (:Group {
     mitre_id: "G0016",
     name: "APT29",
-    description: "APT29 is threat group that has been attributed to Russia...",
+    content_uri: "minio://groups/G0016/description.txt",  # Raw content in object store
     aliases: ["YTTRIUM", "The Dukes", "Cozy Bear"],
     created: datetime("2017-05-31T21:31:53.197Z"),
     modified: datetime("2023-09-29T20:50:52.249Z")
@@ -526,6 +530,102 @@ async def get_threat_intelligence(
     )
     
     return intel
+```
+
+#### **3.1.4 Internal Ingestion Endpoint**
+
+```python
+from pydantic import BaseModel
+from typing import Dict, Any, Optional
+
+class IngestionRequest(BaseModel):
+    content_type: str  # "technique", "tool", "intelligence", "payload"
+    raw_content: str   # Full text content to be processed
+    metadata: Dict[str, Any]  # Additional structured metadata
+    source: str  # Source identifier (e.g., "MITRE", "ExploitDB")
+    mitre_id: Optional[str] = None  # For MITRE-related content
+
+class IngestionResponse(BaseModel):
+    success: bool
+    neo4j_node_id: str  # ID of created/updated node
+    object_store_uri: str  # URI where content was stored
+    message: str
+    processing_time: float
+
+@app.post("/api/v1/internal/ingest", response_model=IngestionResponse)
+async def ingest_unstructured_data(
+    request: IngestionRequest,
+    background_tasks: BackgroundTasks
+) -> IngestionResponse:
+    """
+    Graph-First ingestion endpoint for unstructured security data.
+    
+    Process Flow:
+    1. Store raw content in MinIO object store
+    2. Extract entities and relationships using LLM
+    3. Create/update nodes and edges in Neo4j
+    4. Publish vectorization message to Redis Streams
+    5. Async worker processes embeddings into Qdrant
+    
+    This ensures data consistency with Neo4j as single source of truth.
+    """
+    
+    start_time = time.time()
+    
+    try:
+        # 1. Store raw content in object store
+        content_uri = await object_store.store_content(
+            content_type=request.content_type,
+            content=request.raw_content,
+            metadata=request.metadata
+        )
+        
+        # 2. LLM-powered entity extraction
+        extracted_entities = await llm_extractor.extract_entities(
+            content=request.raw_content,
+            content_type=request.content_type,
+            existing_metadata=request.metadata
+        )
+        
+        # 3. Create/update Neo4j nodes and relationships
+        neo4j_result = await graph_manager.upsert_entities(
+            entities=extracted_entities,
+            content_uri=content_uri,
+            source=request.source
+        )
+        
+        # 4. Publish vectorization message to Redis Streams
+        vectorization_message = {
+            "neo4j_node_id": neo4j_result.node_id,
+            "content_uri": content_uri,
+            "content_type": request.content_type,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        await redis_client.xadd(
+            "vectorization_queue",
+            vectorization_message
+        )
+        
+        processing_time = time.time() - start_time
+        
+        return IngestionResponse(
+            success=True,
+            neo4j_node_id=neo4j_result.node_id,
+            object_store_uri=content_uri,
+            message=f"Successfully ingested {request.content_type} data",
+            processing_time=processing_time
+        )
+        
+    except Exception as e:
+        logger.error(f"Ingestion failed: {str(e)}")
+        return IngestionResponse(
+            success=False,
+            neo4j_node_id="",
+            object_store_uri="",
+            message=f"Ingestion failed: {str(e)}",
+            processing_time=time.time() - start_time
+        )
 ```
 
 ### **3.2 WebSocket Interface**
@@ -881,6 +981,265 @@ class GraphRAGAgent:
             attack_chains.append(chain)
         
         return attack_chains
+```
+
+### **4.4 LLM-Powered Entity Extraction Agent**
+
+```python
+from typing import Dict, List, Any, Optional
+from pydantic import BaseModel
+from google import generativeai as genai
+
+class ExtractedEntity(BaseModel):
+    entity_type: str  # "technique", "tool", "group", "vulnerability", etc.
+    name: str
+    mitre_id: Optional[str] = None
+    properties: Dict[str, Any]
+    relationships: List[Dict[str, str]] = []
+    confidence: float
+
+class LLMEntityExtractor:
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel(model)
+        
+        # Entity extraction prompts optimized for security content
+        self.prompts = {
+            "technique": """
+            Analyze the following cybersecurity content and extract MITRE ATT&CK techniques.
+            
+            For each technique, provide:
+            - MITRE ID (if mentioned)
+            - Name
+            - Platforms affected
+            - Required permissions
+            - Data sources for detection
+            - Relationships to other techniques
+            
+            Content: {content}
+            
+            Return JSON format with extracted entities and their properties.
+            """,
+            
+            "tool": """
+            Extract security tools, malware, and software mentioned in this content.
+            
+            For each tool, identify:
+            - Tool name and aliases
+            - Category (malware, legitimate tool, framework)
+            - Operating systems supported
+            - MITRE techniques implemented
+            - Detection difficulty
+            
+            Content: {content}
+            
+            Return structured JSON with tool information.
+            """,
+            
+            "intelligence": """
+            Extract threat intelligence from this content including:
+            - Threat actor names and aliases
+            - Campaign names
+            - IOCs (if present)
+            - TTPs mentioned
+            - Target sectors
+            - Geographic focus
+            
+            Content: {content}
+            
+            Provide confidence scores for each extracted element.
+            """
+        }
+
+    async def extract_entities(
+        self, 
+        content: str, 
+        content_type: str,
+        existing_metadata: Optional[Dict] = None
+    ) -> List[ExtractedEntity]:
+        """
+        Extract structured entities from unstructured security content.
+        
+        This enables the knowledge graph to evolve dynamically as new
+        information is ingested through the Graph-First architecture.
+        """
+        
+        try:
+            # Select appropriate extraction prompt
+            prompt_template = self.prompts.get(
+                content_type, 
+                self.prompts["technique"]
+            )
+            
+            # Enhance prompt with existing metadata context
+            context_info = ""
+            if existing_metadata:
+                context_info = f"\\nExisting metadata: {existing_metadata}"
+            
+            full_prompt = prompt_template.format(content=content) + context_info
+            
+            # Generate extraction with LLM
+            response = await self.model.generate_content_async(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,  # Low temperature for consistent extraction
+                    candidate_count=1,
+                    max_output_tokens=2048
+                )
+            )
+            
+            # Parse LLM response into structured format
+            extracted_data = self._parse_llm_response(response.text, content_type)
+            
+            # Convert to ExtractedEntity objects
+            entities = []
+            for item in extracted_data:
+                entity = ExtractedEntity(
+                    entity_type=content_type,
+                    name=item.get("name", ""),
+                    mitre_id=item.get("mitre_id"),
+                    properties=item.get("properties", {}),
+                    relationships=item.get("relationships", []),
+                    confidence=item.get("confidence", 0.8)
+                )
+                entities.append(entity)
+            
+            return entities
+            
+        except Exception as e:
+            logger.error(f"Entity extraction failed: {str(e)}")
+            return []
+
+    def _parse_llm_response(self, response: str, content_type: str) -> List[Dict]:
+        """Parse LLM response and convert to structured format."""
+        import json
+        import re
+        
+        try:
+            # Try to extract JSON from response
+            json_match = re.search(r'```json\\n(.*?)\\n```', response, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group(1))
+            
+            # Fallback: try to parse entire response as JSON
+            return json.loads(response)
+            
+        except json.JSONDecodeError:
+            # Fallback: rule-based extraction for common patterns
+            return self._fallback_extraction(response, content_type)
+    
+    def _fallback_extraction(self, text: str, content_type: str) -> List[Dict]:
+        """Rule-based fallback extraction when LLM output isn't parseable."""
+        entities = []
+        
+        if content_type == "technique":
+            # Extract MITRE technique IDs
+            mitre_pattern = r'T\\d{4}(?:\\.\\d{3})?'
+            techniques = re.findall(mitre_pattern, text)
+            
+            for technique_id in techniques:
+                entities.append({
+                    "name": f"MITRE Technique {technique_id}",
+                    "mitre_id": technique_id,
+                    "properties": {"extraction_method": "fallback"},
+                    "confidence": 0.6
+                })
+        
+        return entities
+
+class AsyncVectorizationWorker:
+    """
+    Redis Streams consumer that processes vectorization messages
+    from the Graph-First ingestion pipeline.
+    """
+    
+    def __init__(
+        self, 
+        redis_client,
+        qdrant_client, 
+        securebert_model,
+        object_store
+    ):
+        self.redis = redis_client
+        self.qdrant = qdrant_client
+        self.embedding_model = securebert_model
+        self.object_store = object_store
+        
+    async def start_processing(self):
+        """Start consuming messages from Redis Streams."""
+        
+        while True:
+            try:
+                # Read from vectorization queue
+                messages = await self.redis.xread({
+                    "vectorization_queue": "$"
+                }, block=1000)
+                
+                for stream, msgs in messages:
+                    for msg_id, fields in msgs:
+                        await self._process_vectorization_message(
+                            msg_id, fields
+                        )
+                        
+            except Exception as e:
+                logger.error(f"Vectorization worker error: {str(e)}")
+                await asyncio.sleep(5)  # Brief pause before retry
+    
+    async def _process_vectorization_message(
+        self, 
+        msg_id: str, 
+        fields: Dict[str, str]
+    ):
+        """Process a single vectorization message."""
+        
+        try:
+            # Extract message data
+            neo4j_node_id = fields["neo4j_node_id"]
+            content_uri = fields["content_uri"]
+            content_type = fields["content_type"]
+            
+            # Fetch raw content from object store
+            content = await self.object_store.get_content(content_uri)
+            
+            # Generate SecureBERT embedding
+            embedding = await self.embedding_model.encode(content)
+            
+            # Determine target Qdrant collection
+            collection_name = self._map_content_type_to_collection(content_type)
+            
+            # Upsert vector to Qdrant with neo4j_node_id link
+            await self.qdrant.upsert(
+                collection_name=collection_name,
+                points=[{
+                    "id": neo4j_node_id,
+                    "vector": embedding.tolist(),
+                    "payload": {
+                        "neo4j_node_id": neo4j_node_id,
+                        "content_uri": content_uri,
+                        "content_type": content_type,
+                        "indexed_at": datetime.utcnow().isoformat()
+                    }
+                }]
+            )
+            
+            # Acknowledge message processing
+            await self.redis.xack("vectorization_queue", "workers", msg_id)
+            
+            logger.info(f"Vectorized {content_type} node {neo4j_node_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to process vectorization: {str(e)}")
+            # Message remains in stream for retry
+    
+    def _map_content_type_to_collection(self, content_type: str) -> str:
+        """Map content types to Qdrant collection names."""
+        mapping = {
+            "technique": "techniques",
+            "tool": "tools", 
+            "intelligence": "intelligence",
+            "payload": "payloads"
+        }
+        return mapping.get(content_type, "techniques")
 ```
 
 ---
@@ -1269,6 +1628,7 @@ services:
       - QDRANT_URL=http://qdrant:6333
       - NEO4J_URI=bolt://neo4j:7687
       - REDIS_URL=redis://redis:6379
+      - MINIO_URL=http://minio:9000
       - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
     depends_on:
       qdrant:
@@ -1276,6 +1636,8 @@ services:
       neo4j:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -1466,6 +1828,34 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
     restart: unless-stopped
 
+  # Object Store for Raw Content
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_CONSOLE_ADDRESS=:9001
+    command: server /data --console-address ":9001"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
 volumes:
   qdrant_data:
   neo4j_data:
@@ -1475,6 +1865,7 @@ volumes:
   postgres_data:
   prometheus_data:
   grafana_data:
+  minio_data:
 
 networks:
   default:

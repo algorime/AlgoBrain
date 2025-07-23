@@ -670,13 +670,17 @@ class RiskAssessmentEngine:
 
 **Tasks**:
 1. **Infrastructure Setup**
-   - Docker Compose with Neo4j + Qdrant + Graphiti
+   - Docker Compose with Neo4j + Qdrant + Graphiti + Redis + MinIO
+   - Deploy Redis for caching and message queueing (Graph-First architecture)
+   - Deploy MinIO object store for raw text storage (decoupled data management)
    - Environment configuration management
    - Basic health checks and monitoring
 
 2. **Core Agent Framework**
-   - Implement supervisor agent with basic routing
+   - Implement supervisor agent with LLM-based routing (intelligent query classification)
    - Create traditional RAG agent wrapper around existing Qdrant
+   - Develop unified ingestion service with LLM-powered entity extraction
+   - Implement asynchronous vectorization worker consuming from Redis Streams
    - Basic LangGraph workflow setup
 
 3. **Security & Compliance**
