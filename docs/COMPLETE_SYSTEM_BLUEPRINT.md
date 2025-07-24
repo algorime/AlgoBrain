@@ -499,7 +499,7 @@ This defines the primary API endpoints for interacting with the AlgoBrain system
 *   **Response Body:** `RedTeamResponse`
 *   **Description:** The main endpoint for submitting intelligence queries. It accepts a query string and a detailed context object, and returns a synthesized answer along with provenance and updated context.
 
-#### 9.3.2. WebSocket for Streaming Analysis
+#### 9.3.2. Langserve for Streaming Analysis
 
-*   **Endpoint:** `WS /ws/analysis`
-*   **Description:** A WebSocket endpoint for real-time, multi-step analysis tasks. The client can start an analysis and receive a stream of updates as the supervisor agent executes the plan.
+*   **Endpoint:** `POST /analysis/stream`
+*   **Description:** A `langserve` endpoint for real-time, multi-step analysis tasks. It streams LangChain Expression Language (LCEL) outputs directly, providing a robust and efficient mechanism for observing the supervisor agent's execution plan. The endpoint includes a built-in playground for easy testing and debugging.
