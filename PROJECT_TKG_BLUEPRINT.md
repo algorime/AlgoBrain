@@ -68,13 +68,15 @@ The ETL pipeline will be implemented as defined in `src/ingestion/tkg_importer.p
 
 Based on the chosen path, the following gaps have been identified and must be addressed in the design and implementation phases (Phase 2 and 3):
 
-1.  **Graph Database Technology:** The `tkg_importer.py` script is implemented using Neo4j. However, the final choice of graph database technology has not been formalized. A trade study should be conducted to confirm Neo4j as the optimal choice or to select an alternative (e.g., Amazon Neptune, TigerGraph).
+1.  **Graph Database Operations:** With Neo4j confirmed as the graph database, the focus shifts to operationalizing it. A plan for managing the self-hosted Docker container is required, including data volume persistence, backup and recovery strategies, resource allocation (CPU/memory), and monitoring for production readiness.
 
-2.  **Query Interface:** While the schema is defined, a formal query interface or API for accessing the knowledge graph has not been designed. This will be a critical component for integrating the graph with other systems.
+2.  **Query Interface:** The project will adopt **`graphiti`** as the official query interface. This library provides a dual-access model for interacting with the knowledge graph: a programmatic, Pydantic-based interface for developers to execute raw Cypher, and a high-level, natural language interface for analysts. The implementation will involve wrapping `graphiti` in a simple API to expose these capabilities to other systems.
 
 3.  **Data Updates and Synchronization:** The current script performs a full, destructive import. A strategy for incremental updates and synchronization with the MITRE ATT&CK framework is required for long-term maintenance.
 
 4.  **Extensibility:** The chosen model is intentionally rigid. A plan for future extensibility, potentially incorporating the findings of the internal research (e.g., a multi-layered ontology), should be developed to guide the project's long-term evolution.
+
+5.  **Technology Validation and Proof of Concept:** Before full implementation, a Proof of Concept (PoC) must be developed to validate `graphiti`'s ability to handle the complexity of the TKG schema and anticipated query patterns. This PoC will serve to de-risk the technology choice and inform the design of the final API wrapper.
 
 ## 6. Conclusion
 
@@ -242,6 +244,66 @@ The choice to formalize Neo4j is based on a comprehensive evaluation of its capa
 
 3.  **Ease of Integration and Ecosystem:** Neo4j has a mature ecosystem with robust client libraries for major programming languages, including the Python driver used in the reference importer. Its strong community support, extensive documentation, and enterprise-ready features (e.g., clustering, security, monitoring) make it a low-risk, high-reward choice for a production system.
 
+4.  **Deployment Flexibility (Docker):** Deploying Neo4j via Docker provides unmatched flexibility and portability. It allows for a consistent environment across development, staging, and production, simplifies dependency management, and enables scalable, isolated deployments. This aligns with modern DevOps practices and ensures the project's infrastructure is both robust and maintainable.
+
+### 2.1.1. Deployment Model: Self-Hosted Docker
+
+**Recommendation:** Neo4j will be deployed as a self-hosted container using Docker. This approach provides a consistent, portable, and isolated environment for the database, simplifying dependency management and ensuring reproducibility across development, testing, and production environments.
+
+**Example `docker-compose.yml`:**
+```yaml
+version: '3.8'
+services:
+  neo4j:
+    image: neo4j:latest
+    container_name: project_tkg_neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - ./neo4j/data:/data
+      - ./neo4j/logs:/logs
+      - ./neo4j/conf:/var/lib/neo4j/conf
+    environment:
+      - NEO4J_AUTH=neo4j/your_strong_password
+```
+
+### 2.2. Query Interface Layer: graphiti
+
+**Recommendation:** The project will use **`graphiti`** as the primary library for data modeling and query interaction.
+
+**Justification:**
+`graphiti` directly addresses the need for a formal, accessible query interface. Its selection is justified by three key features:
+
+1.  **Schema-First Development:** By using Pydantic models to define the graph schema, `graphiti` provides a Python-native, type-safe, and self-documenting layer for all graph interactions. This aligns with the project's goal of maintaining a clear and enforceable schema.
+2.  **Simplified Data Access:** The library automatically deserializes query results into Pydantic objects, abstracting away the manual parsing of database records and simplifying application logic.
+3.  **Natural Language Accessibility:** `graphiti`'s built-in capability to translate natural language questions into Cypher queries significantly lowers the barrier to entry for security analysts and other non-developer stakeholders, allowing them to explore the knowledge graph without writing Cypher.
+
+**Architecture:**
+The following diagram illustrates how `graphiti` will serve as the intermediary between the application layer and the Neo4j database.
+
+```mermaid
+graph TD
+    subgraph Application Layer
+        A[API Endpoint (e.g., FastAPI)]
+        B[Natural Language Query]
+        C[Programmatic Query (Cypher)]
+    end
+
+    subgraph Query Interface
+        G[graphiti]
+    end
+
+    subgraph Database
+        N[Neo4j]
+    end
+
+    B -- Translates --> G
+    C -- Executes --> G
+    A -- Wraps --> G
+    G -- Cypher --> N
+```
+
 ## 3. Automated Ingestion Pipeline
 
 This section formally documents the design of the automated ingestion pipeline, which is responsible for populating and maintaining the knowledge graph.
@@ -288,3 +350,11 @@ graph TD
 3.  **Transforming to Graph-Native Structures:** The filtered STIX objects are transformed into a format suitable for Neo4j. This involves extracting key properties and preparing them for batch import as nodes and relationships that conform to the `FORMAL_GRAPH_SCHEMA_SPECIFICATION.md`.
 
 4.  **Idempotent Database Writing:** The transformed data is written to the Neo4j database using an idempotent `MERGE` operation. This ensures that running the import multiple times will not create duplicate nodes or relationships. The process is batched by node and relationship type for high performance and reliability, and it begins by clearing the database to ensure a fresh, consistent state with each run.
+
+
+# Model API-key
+A working Gemini API key (with google-ai-studio as provider) is present in ./.env file:
+GEMINI_API_KEY=AIzaSyBj0TK4W3ua2Ux5hchDiAZUqRSS-ivZs3w
+GEMINI_MODEL_PROVIDER=google_ai_studio  # Options: "google_ai_studio", "vertex_ai"
+GEMINI_CHAT_MODEL=models/gemini-2.5-flash-preview-05-20
+GEMINI_EMBEDDING_MODEL=models/gemini-embedding-exp-03-07
